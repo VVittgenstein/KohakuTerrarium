@@ -163,6 +163,9 @@ class TestResumeIntoEngine:
             return fake_agent, fake_store
 
         monkeypatch.setattr(resume_mod, "resume_agent", _resume_agent)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
 
         t = await TestTerrariumBuilder().build()
         try:
@@ -206,6 +209,9 @@ class TestResumeIntoEngine:
             injects.append(name)
 
         monkeypatch.setattr(resume_mod, "inject_saved_state", _inject)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
 
         t = await TestTerrariumBuilder().build()
         try:
@@ -273,6 +279,7 @@ class TestResumeIntoEngine:
         # Stub apply_recipe to build a fake creature directly.
 
         async def _fake_apply_recipe(config, pwd=None, **_):
+            assert pwd == "."
             t = engine_holder["t"]
             agent = _FakeAgent(name="alice")
             agent.config = SimpleNamespace(name="alice")
@@ -287,6 +294,9 @@ class TestResumeIntoEngine:
             return t._topology.graphs[c.graph_id]
 
         monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
 
         engine_holder = {}
         t = await TestTerrariumBuilder().build()
@@ -353,6 +363,9 @@ class TestResumeIntoEngine:
                 running_at_replay.append(engine.get_creature(cid).agent.is_running)
 
         monkeypatch.setattr(resume_mod._topo_snap, "replay", _fake_replay)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
 
         t = await TestTerrariumBuilder().build()
         engine_holder["t"] = t
@@ -399,6 +412,9 @@ class TestResumeIntoEngine:
         fake_config = TerrariumConfig(name="t", creatures=[], channels=[])
         monkeypatch.setattr(resume_mod, "load_terrarium_config", lambda p: fake_config)
         monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *a, **kw: None)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
 
         session_dir = tmp_path / "sessions"
         session_dir.mkdir()
@@ -641,6 +657,9 @@ class TestResumeIntoEngine:
         fake_store = SimpleNamespace(path=str(tmp_path / "a.kohakutr"))
         monkeypatch.setattr(
             resume_mod, "resume_agent", lambda *a, **k: (fake_agent, fake_store)
+        )
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
         )
 
         t = Terrarium(
