@@ -20,6 +20,7 @@ from kohakuterrarium.studio.sessions.lifecycle import (
     _build_session_handle,
     now_iso as _now_iso,
 )
+from kohakuterrarium.studio.sessions import index_hooks
 from kohakuterrarium.studio.sessions.registry import meta_for, stores_for
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.terrarium import TerrariumService
@@ -58,6 +59,7 @@ async def resume_session(
     path: Path | str,
     *,
     pwd_override: str | None = None,
+    workspace_overrides: dict[str, str] | None = None,
     llm: str | None = None,
 ) -> Session:
     """Adopt a saved session and register it with Studio lifecycle state.
@@ -71,7 +73,12 @@ async def resume_session(
     # file as a side effect of opening it.
     if not path.exists() and not discover_versions(path):
         raise SessionNotFoundError(f"Session not found: {path}")
-    sid = await engine.adopt_session(path, pwd=pwd_override, llm=llm)
+    sid = await engine.adopt_session(
+        path,
+        pwd=pwd_override,
+        workspace_overrides=workspace_overrides,
+        llm=llm,
+    )
 
     # Lifecycle registries must contain resumed graphs so listing and lookup
     # treat them like newly started sessions.
@@ -89,6 +96,7 @@ async def resume_session(
     }
     if store is not None:
         stores_for(service)[sid] = store
+        index_hooks.attach(sid, store, path.parent)
 
     logger.info(
         "Resumed session registered with studio",

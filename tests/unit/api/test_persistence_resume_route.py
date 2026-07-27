@@ -2,12 +2,25 @@
 
 from pathlib import Path
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from kohakuterrarium.api.deps import get_engine, get_service
+from kohakuterrarium.api.deps import (
+    get_service_factory,
+    resolve_request_session_dir,
+)
 from kohakuterrarium.api.routes.persistence import resume as resume_mod
+from kohakuterrarium.api.routes.persistence.resume_remote import worker_absolute_for
+from kohakuterrarium.core.config import AgentConfig
+from kohakuterrarium.core.config_serde import pack_agent_config
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions.handles import Session
+from kohakuterrarium.terrarium.graph_manifest import MANIFEST_KEY
+from kohakuterrarium.terrarium.workspace_resume import (
+    WorkspaceResumeError,
+    WorkspaceResumeFailure,
+)
 
 
 class _LocalEngine:
@@ -18,10 +31,23 @@ class _LocalService:
     pass
 
 
-def _app(*, engine=None, service=None) -> FastAPI:
+@pytest.fixture(autouse=True)
+def _skip_real_resume_prepare(monkeypatch):
+    monkeypatch.setattr(resume_mod, "prepare_resume_workspace", lambda *a, **k: None)
+
+
+def _app(
+    *,
+    engine=None,
+    service=None,
+    service_factory=None,
+    session_dir: Path = Path("/"),
+) -> FastAPI:
     app = FastAPI()
-    app.dependency_overrides[get_engine] = lambda: engine or _LocalEngine()
-    app.dependency_overrides[get_service] = lambda: service or _LocalService()
+    resolved = service or engine or _LocalService()
+    factory = service_factory or (lambda: resolved)
+    app.dependency_overrides[get_service_factory] = lambda: factory
+    app.dependency_overrides[resolve_request_session_dir] = lambda: session_dir
     app.include_router(resume_mod.router, prefix="/sessions")
     return app
 
@@ -36,6 +62,36 @@ def _session(*, sid="sess-1", name="alice", creatures=None):
     )
 
 
+def _write_workspace_session(path: Path, valid_pwd: Path, missing_pwd: Path) -> None:
+    store = SessionStore(path)
+    store.init_meta("saved", "terrarium", "", str(valid_pwd), ["alice", "bob"])
+    store.meta[MANIFEST_KEY] = {
+        "kind": "kohakuterrarium.live_graph",
+        "version": 1,
+        "revision": 4,
+        "graph_id": "graph-saved",
+        "creatures": [
+            {
+                "creature_id": creature_id,
+                "name": name,
+                "config_snapshot": pack_agent_config(AgentConfig(name=name)),
+                "source_ref": f"@pack/{name}",
+                "pwd": str(pwd),
+                "is_privileged": name == "alice",
+                "parent_creature_id": None,
+            }
+            for creature_id, name, pwd in (
+                ("alice-id", "alice", valid_pwd),
+                ("bob-id", "bob", missing_pwd),
+            )
+        ],
+        "channels": [],
+        "listen": [],
+        "send": [],
+    }
+    store.close(update_status=False)
+
+
 # ── _worker_absolute_for ───────────────────────────────────────
 
 
@@ -43,7 +99,7 @@ class TestWorkerAbsoluteFor:
     def test_expands_under_kohakuterrarium(self, monkeypatch):
         # Verify the HOME-derived fallback, not the autouse env override.
         monkeypatch.delenv("KT_CONFIG_DIR", raising=False)
-        out = resume_mod._worker_absolute_for("resume/alice.kohakutr")
+        out = worker_absolute_for("resume/alice.kohakutr")
         # Path-style ends with the relative.
         assert "alice.kohakutr" in out
         assert ".kohakuterrarium" in out
@@ -53,8 +109,171 @@ class TestWorkerAbsoluteFor:
 
 
 class TestHostResume:
+    def test_preflight_and_targeted_replacement_are_read_only(
+        self, monkeypatch, tmp_path
+    ):
+        valid_pwd = tmp_path / "valid"
+        replacement = tmp_path / "replacement"
+        valid_pwd.mkdir()
+        replacement.mkdir()
+        path = tmp_path / "saved.kohakutr"
+        _write_workspace_session(path, valid_pwd, tmp_path / "missing")
+        seen_dirs = []
+
+        def resolve(name, session_dir):
+            seen_dirs.append(session_dir)
+            return path if name == "saved" else None
+
+        def forbidden_factory():
+            pytest.fail("local preflight must not construct a runtime service")
+
+        monkeypatch.setattr(resume_mod, "resolve_session_path_in", resolve)
+        client = TestClient(
+            _app(
+                service_factory=forbidden_factory,
+                session_dir=tmp_path / "request-sessions",
+            )
+        )
+
+        unresolved = client.post("/sessions/saved/resume/preflight")
+        assert unresolved.status_code == 200
+        assert unresolved.json()["ready"] is False
+        assert unresolved.json()["gaps"][0]["creature_ids"] == ["bob-id"]
+
+        resolved = client.post(
+            "/sessions/saved/resume/preflight",
+            json={"workspace_overrides": {"bob-id": str(replacement)}},
+        )
+        assert resolved.status_code == 200
+        body = resolved.json()
+        assert body["ready"] is True
+        assert {
+            member["creature_id"]: member["saved_pwd"] for member in body["members"]
+        } == {
+            "alice-id": str(valid_pwd),
+            "bob-id": str(replacement),
+        }
+        assert seen_dirs == [
+            tmp_path / "request-sessions",
+            tmp_path / "request-sessions",
+        ]
+
+    def test_preflight_reports_partial_dirty_as_conflict(self, monkeypatch, tmp_path):
+        valid_pwd = tmp_path / "valid"
+        valid_pwd.mkdir()
+        path = tmp_path / "dirty.kohakutr"
+        _write_workspace_session(path, valid_pwd, tmp_path / "missing")
+        store = SessionStore(path)
+        store.meta["workspace_resume_state"] = {"status": "partial_dirty"}
+        store.close(update_status=False)
+        monkeypatch.setattr(resume_mod, "resolve_session_path_in", lambda *_args: path)
+
+        response = TestClient(_app(service_factory=lambda: None)).post(
+            "/sessions/dirty/resume/preflight"
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "stale_manifest"
+
+    def test_local_resume_orders_preflight_before_service_and_forwards_overrides(
+        self, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "saved.kohakutr"
+        events = []
+        service = _LocalService()
+
+        def resolve(name, session_dir):
+            events.append(("resolve", name, session_dir))
+            return path
+
+        def prepare(target, **kwargs):
+            events.append(("preflight", target, kwargs))
+
+        def factory():
+            events.append(("service",))
+            return service
+
+        async def fake_resume(
+            actual_service, target, pwd_override=None, workspace_overrides=None
+        ):
+            events.append(
+                (
+                    "resume",
+                    actual_service,
+                    target,
+                    pwd_override,
+                    workspace_overrides,
+                )
+            )
+            return _session()
+
+        monkeypatch.setattr(resume_mod, "resolve_session_path_in", resolve)
+        monkeypatch.setattr(resume_mod, "prepare_resume_workspace", prepare)
+        monkeypatch.setattr(resume_mod, "studio_resume", fake_resume)
+        session_dir = tmp_path / "request-sessions"
+        client = TestClient(_app(service_factory=factory, session_dir=session_dir))
+
+        response = client.post(
+            "/sessions/saved/resume",
+            json={"workspace_overrides": {"bob-id": str(tmp_path)}},
+        )
+
+        assert response.status_code == 200
+        assert [event[0] for event in events] == [
+            "resolve",
+            "preflight",
+            "service",
+            "resume",
+        ]
+        assert events[0] == ("resolve", "saved", session_dir)
+        assert events[1][2] == {
+            "pwd": None,
+            "workspace_overrides": {"bob-id": str(tmp_path)},
+        }
+        assert events[3][1:] == (
+            service,
+            path,
+            None,
+            {"bob-id": str(tmp_path)},
+        )
+
+    def test_unresolved_preflight_has_no_runtime_side_effect(
+        self, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "saved.kohakutr"
+        calls = []
+        monkeypatch.setattr(resume_mod, "resolve_session_path_in", lambda *_args: path)
+
+        def unresolved(*_args, **_kwargs):
+            calls.append("preflight")
+            raise WorkspaceResumeError(
+                WorkspaceResumeFailure.UNRESOLVED,
+                "replacement required",
+                creature_ids=("bob-id",),
+            )
+
+        def forbidden_factory():
+            calls.append("service")
+            return _LocalService()
+
+        async def forbidden_resume(*_args, **_kwargs):
+            calls.append("resume")
+            return _session()
+
+        monkeypatch.setattr(resume_mod, "prepare_resume_workspace", unresolved)
+        monkeypatch.setattr(resume_mod, "studio_resume", forbidden_resume)
+        client = TestClient(_app(service_factory=forbidden_factory))
+
+        response = client.post("/sessions/saved/resume")
+
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "unresolved"
+        assert calls == ["preflight"]
+
     def test_session_missing(self, monkeypatch):
-        monkeypatch.setattr(resume_mod, "resolve_session_path_default", lambda n: None)
+        monkeypatch.setattr(
+            resume_mod, "resolve_session_path_in", lambda n, _session_dir: None
+        )
         client = TestClient(_app())
         resp = client.post("/sessions/ghost/resume")
         assert resp.status_code == 404
@@ -62,11 +281,13 @@ class TestHostResume:
     def test_host_success_agent(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
-        async def fake_resume(engine, path, pwd_override=None):
+        async def fake_resume(
+            engine, path, pwd_override=None, workspace_overrides=None
+        ):
             return _session()
 
         monkeypatch.setattr(resume_mod, "studio_resume", fake_resume)
@@ -80,11 +301,13 @@ class TestHostResume:
     def test_host_success_terrarium(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
-        async def fake_resume(engine, path, pwd_override=None):
+        async def fake_resume(
+            engine, path, pwd_override=None, workspace_overrides=None
+        ):
             return _session(
                 creatures=[
                     {"creature_id": "c1", "name": "alice"},
@@ -101,11 +324,11 @@ class TestHostResume:
     def test_file_not_found_404(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
-        async def boom(engine, path, pwd_override=None):
+        async def boom(engine, path, pwd_override=None, workspace_overrides=None):
             raise FileNotFoundError("no such file")
 
         monkeypatch.setattr(resume_mod, "studio_resume", boom)
@@ -116,11 +339,11 @@ class TestHostResume:
     def test_value_error_400(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
-        async def boom(engine, path, pwd_override=None):
+        async def boom(engine, path, pwd_override=None, workspace_overrides=None):
             raise ValueError("bad payload")
 
         monkeypatch.setattr(resume_mod, "studio_resume", boom)
@@ -131,13 +354,15 @@ class TestHostResume:
     def test_default_on_node_is_host(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
         called_with = {}
 
-        async def fake_resume(engine, path, pwd_override=None):
+        async def fake_resume(
+            engine, path, pwd_override=None, workspace_overrides=None
+        ):
             called_with["path"] = path
             called_with["pwd_override"] = pwd_override
             return _session()
@@ -155,13 +380,15 @@ class TestHostResume:
         # start — not be patched on afterwards.
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
         called_with = {}
 
-        async def fake_resume(engine, path, pwd_override=None):
+        async def fake_resume(
+            engine, path, pwd_override=None, workspace_overrides=None
+        ):
             called_with["pwd_override"] = pwd_override
             return _session()
 
@@ -179,8 +406,8 @@ class TestRemoteResume:
     def test_no_lab_host(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
         # Service has no `.host` attribute → 404.
         client = TestClient(_app())
@@ -190,8 +417,8 @@ class TestRemoteResume:
     def test_unknown_node(self, monkeypatch):
         monkeypatch.setattr(
             resume_mod,
-            "resolve_session_path_default",
-            lambda n: Path("/x/s.kohakutr"),
+            "resolve_session_path_in",
+            lambda n, _session_dir: Path("/x/s.kohakutr"),
         )
 
         class _Svc:
