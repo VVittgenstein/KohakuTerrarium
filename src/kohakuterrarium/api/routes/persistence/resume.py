@@ -239,6 +239,14 @@ async def resume_session(
             detail="pwd and workspace_overrides are mutually exclusive",
         )
     on_node = (req.on_node if req is not None else "_host") or "_host"
+    if (
+        on_node == "_host"
+        and getattr(request.app.state, "lab_mode", "standalone") == "lab-host"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Laboratory hosts cannot resume agents on _host; choose a worker",
+        )
 
     path = await asyncio.to_thread(resolve_session_path_in, session_name, session_dir)
     if path is None:
