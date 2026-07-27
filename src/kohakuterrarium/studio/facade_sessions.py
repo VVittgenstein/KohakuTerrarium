@@ -72,6 +72,7 @@ class _SessionsNS:
         pwd: str | None = None,
         llm: str | None = None,
         name: str | None = None,
+        on_node: str = "_host",
     ) -> _session_handles.Session:
         return await _session_lifecycle.start_terrarium(
             self._studio._service,
@@ -79,6 +80,7 @@ class _SessionsNS:
             pwd=pwd,
             llm=llm,
             name=name,
+            on_node=on_node,
         )
 
     def list(self) -> list[_session_handles.SessionListing]:
