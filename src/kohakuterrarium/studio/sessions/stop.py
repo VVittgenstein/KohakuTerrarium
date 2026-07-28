@@ -71,12 +71,13 @@ async def stop_session(
         meta_entry = meta.get(session_id)
         if meta_entry is None or not meta_entry.get("on_node"):
             raise KeyError(f"session {session_id!r} not found")
-        cid = meta_entry.get("creature_id")
-        if cid and hasattr(service, "remove_creature"):
+        creature_ids = meta_entry.get("creature_ids") or [meta_entry.get("creature_id")]
+        for cid in reversed([item for item in creature_ids if item]):
+            if not hasattr(service, "remove_creature"):
+                break
             try:
                 await service.remove_creature(cid)
             except KeyError:
-                # Missing worker state must not leave stale host metadata.
                 pass
 
     meta.pop(session_id, None)
