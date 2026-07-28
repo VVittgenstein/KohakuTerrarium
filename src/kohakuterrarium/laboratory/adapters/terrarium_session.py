@@ -9,9 +9,18 @@ from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.laboratory.adapters.file_scopes import resolve_in_scope
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.graph_manifest import parse_manifest
+from kohakuterrarium.terrarium.workspace_resume import (
+    preflight_session_workspaces,
+    WorkspaceResumeError,
+    plan_workspace_resume,
+    preflight_to_dict,
+    preflight_workspace_resume,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -51,8 +60,12 @@ class TerrariumSessionAdapter:
                 return self._op_search(msg.body)
             case "stores":
                 return self._op_stores(msg.body)
+            case "workspace_preflight":
+                return self._op_workspace_preflight(msg.body)
             case "resume":
                 return await self._op_resume(msg.body)
+            case "remove":
+                return await self._op_remove(msg.body)
             case _:
                 return {
                     "error": {
@@ -95,17 +108,109 @@ class TerrariumSessionAdapter:
         stores = getattr(self._engine, "_session_stores", {}) or {}
         return {"session_ids": sorted(stores.keys())}
 
-    async def _op_resume(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Adopt a session file already present on the worker."""
+    def _op_workspace_preflight(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate saved paths on the worker without creating a runtime."""
+        raw_manifest = body.get("manifest")
+        if raw_manifest is not None:
+            manifest = parse_manifest(raw_manifest)
+            replacements = body.get("workspace_overrides")
+            pwd_override = body.get("pwd_override")
+            if pwd_override is not None and replacements:
+                raise ValueError(
+                    "pwd_override and workspace_overrides are mutually exclusive"
+                )
+            if pwd_override is not None:
+                replacements = {
+                    item.creature_id: pwd_override for item in manifest.creatures
+                }
+            try:
+                plan = plan_workspace_resume(
+                    manifest,
+                    replacements,
+                    allow_valid_targets=pwd_override is not None,
+                )
+            except WorkspaceResumeError as exc:
+                return {
+                    "legacy": False,
+                    "ready": False,
+                    "members": [],
+                    "gaps": [],
+                    "error": {"code": exc.code.value, "message": str(exc)},
+                }
+            preflight = preflight_workspace_resume(plan.manifest)
+            return {"legacy": False, **preflight_to_dict(preflight)}
+        saved_pwd = body.get("legacy_pwd")
+        if "legacy_pwd" in body:
+            effective_pwd = body.get("pwd_override") or saved_pwd
+            has_pwd = isinstance(effective_pwd, str) and bool(effective_pwd.strip())
+            ready = has_pwd and Path(effective_pwd).is_dir()
+            return {
+                "legacy": True,
+                "ready": ready,
+                "members": [],
+                "gaps": (
+                    []
+                    if ready
+                    else [
+                        {
+                            "gap_id": "legacy",
+                            "saved_pwd": (
+                                effective_pwd if isinstance(effective_pwd, str) else ""
+                            ),
+                            "status": "invalid",
+                            "creature_ids": [],
+                        }
+                    ]
+                ),
+            }
         path = body.get("path")
         if not isinstance(path, str) or not path:
-            raise ValueError("path is required")
+            raise ValueError("path, manifest, or legacy_pwd is required")
         local = Path(path)
         if not local.exists():
             raise FileNotFoundError(f"no .kohakutr at {path!r}")
+        preflight = preflight_session_workspaces(local)
+        if preflight is None:
+            return {"legacy": True, "ready": True, "members": [], "gaps": []}
+        return {"legacy": False, **preflight_to_dict(preflight)}
+
+    async def _op_remove(self, body: dict[str, Any]) -> dict[str, Any]:
+        session_id = body.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id is required")
+        creature_ids = [
+            creature.creature_id
+            for creature in self._engine.creatures.values()
+            if creature.graph_id == session_id
+        ]
+        for creature_id in creature_ids:
+            await self._engine.remove_creature(creature_id)
+        return {"removed": creature_ids}
+
+    async def _op_resume(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Adopt a session file already present on the worker."""
+        scope = body.get("scope")
+        rel = body.get("rel")
+        if isinstance(scope, str) and scope:
+            if not isinstance(rel, str) or not rel:
+                raise ValueError("rel is required with scope")
+            local = resolve_in_scope(scope, rel, self._engine)
+        else:
+            path = body.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError("path or scope+rel is required")
+            local = Path(path)
+        workspace_overrides = body.get("workspace_overrides")
+        if body.get("pwd_override") is not None and workspace_overrides:
+            raise ValueError(
+                "pwd_override and workspace_overrides are mutually exclusive"
+            )
+        if not local.exists():
+            raise FileNotFoundError(f"no .kohakutr at {str(local)!r}")
         sid = await self._engine.adopt_session(
             local,
             pwd=body.get("pwd_override"),
+            workspace_overrides=workspace_overrides,
             llm=body.get("llm"),
         )
         store = getattr(self._engine, "_session_stores", {}).get(sid)
