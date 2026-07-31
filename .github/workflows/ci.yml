@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, agent/stack-ci-base-20260731]
 
 jobs:
   lint:
